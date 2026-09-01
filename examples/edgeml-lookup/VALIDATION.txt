@@ -2,11 +2,13 @@
  EdgeML prompt-lookup speculative decoder for llama.cpp — VALIDATION
 ================================================================================
 Model  : qwen-1.7b.gguf  (Qwen2.5-1.7B-Instruct Q4_K_M, 986 MB)
-Host   : Apple M1, macOS arm64, Metal + Accelerate backends
+Host   : Apple M1, macOS arm64 (Darwin), 8 cores; backends compiled: Metal +
+         Accelerate/BLAS + CPU
 Base   : llama.cpp @ tag b10615 (commit f280b2698), ggml 0.21.0
 Binary : build/bin/llama-edgeml-lookup
 Default: EDGEML_D=8, EDGEML_MIN_SCORE=5 (confidence gate), EDGEML_WARMUP=64,
-         EDGEML_NO_REGRESS=128, EDGEML_EMA_WINDOW=64
+         EDGEML_NO_REGRESS=128, EDGEML_EMA_WINDOW=64,
+         EDGEML_CPU_SAFE_D=2 (CPU-backend draft-width clamp; see Gate 2)
 
 RULE (honesty): every number below is followed by the EXACT command that
 produced it. Nothing is interpolated, extrapolated, or estimated. Anything not
@@ -20,45 +22,85 @@ and the reported quantity is the ON/OFF median RATIO, which is robust to
 throttling. Bit-exactness and the self-test are deterministic (thermal-
 independent). Peak RSS is sampled 3x per condition (it is noisy on the OFF side).
 
-All tok/s / bit-exact / RSS runs below are from ONE consolidated pass
-(/tmp/gate_verify.sh) on the current gated binary, unless labeled otherwise.
+WHAT CHANGED SINCE THE FIRST DROP (CPU-backend bit-exactness fix):
+A downstream verifier reproduced the speed claims on a second architecture
+(Linux aarch64, Neoverse-N1, gcc 12, CPU-only) but found that on the CPU backend
+(-ngl 0) the spec token ids DIVERGED from the width-1 greedy baseline at draft
+width >= 4 (D >= 3). Root cause (confirmed here): a wide (>=4-wide) batched decode
+on the ggml CPU matmul path sums the logit dot-products in a different order than
+a width-1 decode; that reordering can flip a near-tie greedy argmax. It is
+floating-point non-associativity, NOT an indexing bug, and it does NOT occur on
+Metal (whose reductions match width-1 at all D). The first drop's Gate 2 passed
+because it was measured on Metal only. Fix: on the CPU path (n_gpu_layers == 0)
+clamp the draft width to EDGEML_CPU_SAFE_D (default 2, the measured bit-exact
+maximum) unless EDGEML_ALLOW_WIDE_CPU=1. This makes "spec ids == greedy ids" true
+BY CONSTRUCTION on CPU. Gate 2 below is now a per-backend x per-D matrix. The
+clamp has a measured speed cost on CPU (Gate 3b / Gate 4) — reported, not hidden.
 
 --------------------------------------------------------------------------------
  GATE 1 — clean build, no new warnings (macOS arm64)                    [PASS]
 --------------------------------------------------------------------------------
 cmd: touch examples/edgeml-lookup/edgeml-lookup.cpp \
      && cmake --build build --target llama-edgeml-lookup
-out: build rc=0
-     (no line matching /warning|error/ in build output)
-     [100%] Building CXX object .../llama-edgeml-lookup.dir/edgeml-lookup.cpp.o
+out: [100%] Building CXX object .../llama-edgeml-lookup.dir/edgeml-lookup.cpp.o
      [100%] Linking CXX executable ../../bin/llama-edgeml-lookup
      [100%] Built target llama-edgeml-lookup
+     (no line matching /warning|error/ from compiling edgeml-lookup.cpp)
 note: no ggml/core files are touched. The only change outside
       examples/edgeml-lookup/ is one line in examples/CMakeLists.txt
-      (add_subdirectory(edgeml-lookup)).
+      (add_subdirectory(edgeml-lookup)). The CPU clamp is confined to
+      examples/edgeml-lookup/edgeml-lookup.cpp.
 
 --------------------------------------------------------------------------------
- GATE 2 — bit-exact greedy: spec(ON) token ids == baseline(OFF) ids     [PASS]
+ GATE 2 — bit-exact greedy: spec(ON) ids == baseline(OFF) ids           [PASS]
+          per-backend x per-D matrix (this is the fix's re-verify)
 --------------------------------------------------------------------------------
+2a) SHIPPED DEFAULTS — one command per backend (the shipped clamp path on CPU):
+
 cmd: BIN=build/bin/llama-edgeml-lookup MODEL=qwen-1.7b.gguf \
-     examples/edgeml-lookup/bench/bitexact.sh 128 99
-     (dumps generated token ids ON vs OFF with EDGEML_DUMP_IDS, diffs the ids)
-out: prompt          n_ids   result
-     p01.txt         128     IDENTICAL
-     p02.txt         128     IDENTICAL
-     p03.txt         128     IDENTICAL
-     p04.txt         128     IDENTICAL
-     p05.txt         128     IDENTICAL
-     p06.txt         128     IDENTICAL
-     p07.txt         128     IDENTICAL
-     p08.txt         128     IDENTICAL
-     p09.txt         128     IDENTICAL
-     p10.txt         128     IDENTICAL
-     prose_novel.txt 128     IDENTICAL
-     ----
+     examples/edgeml-lookup/bench/bitexact.sh 128 0     # CPU  (-ngl 0, D auto-clamped to 2)
+out: p01..p10 + prose_novel : 128 ids each : IDENTICAL
      bit-exact: 11/11 prompts IDENTICAL (spec == greedy)
-note: acceptance is greedy-argmax verification, so the gate only changes WHICH
-      tokens are drafted (speed), never which are emitted. Zero quality loss.
+
+cmd: ... examples/edgeml-lookup/bench/bitexact.sh 128 99   # METAL (-ngl 99, D=8, no clamp)
+out: p01..p10 + prose_novel : 128 ids each : IDENTICAL
+     bit-exact: 11/11 prompts IDENTICAL (spec == greedy)
+
+2b) PER-D MATRIX — RAW draft widths forced with EDGEML_ALLOW_WIDE_CPU=1
+    EDGEML_D=<D> (clamp bypassed), spec ids diffed against the width-1 OFF
+    baseline of the SAME backend. Shows exactly why 2 is the CPU-safe cap.
+
+cmd: BIN=... MODEL=... bash /tmp/perD_matrix.sh   # 11 canonical prompts, n=128, t=4
+out: backend CPU (-ngl 0)     vs width-1 OFF (same backend)
+       D    summary          differing prompts (ndiff@first)
+       1    11/11 IDENTICAL   (all identical)
+       2    11/11 IDENTICAL   (all identical)          <-- EDGEML_CPU_SAFE_D default
+       3     5/11 IDENTICAL   p02(48@79) p03(114@10) p04(40@87) p05(2@102) p06(60@67) prose_novel(64@64)
+       8     5/11 IDENTICAL   p02(48@79) p03(114@10) p04(40@87) p05(6@102) p06(60@67) prose_novel(64@64)
+     backend METAL (-ngl 99)  vs width-1 OFF (same backend)
+       D    summary          differing prompts (ndiff@first)
+       2    11/11 IDENTICAL   (all identical)
+       3    11/11 IDENTICAL   (all identical)
+       8    11/11 IDENTICAL   (all identical)
+read: CPU is bit-exact up to batch width 3 (D<=2) and diverges at width>=4 (D>=3);
+      Metal is bit-exact at all D. The divergence is deterministic and grows with
+      width (p05: 2 ids at D=3 -> 6 ids at D=8), first flip at token 102 on p05 —
+      matching the downstream aarch64 report. This is FP reduction-order, not logic.
+
+2c) CORROBORATION — independent post-fix matrix over 12 prompts (adds
+    code_repetitive), NEW binary, comparing each config to its own OFF baseline:
+cmd: bash /tmp/postfix_verify.sh
+out: 1) CPU  -ngl 0  DEFAULT (clamped, effective D=2) : 12/12 IDENTICAL
+     2) CPU  -ngl 0  OPT-OUT (EDGEML_ALLOW_WIDE_CPU=1 EDGEML_D=8) :
+        6/12 IDENTICAL  (p02 p03 p04 p05 p06 prose_novel DIFFER — the raw bug the
+        clamp prevents, reproduced on the SAME shipping binary via the opt-out)
+     3) METAL -ngl 99 DEFAULT (D=8, no clamp) : 12/12 IDENTICAL (unchanged by fix)
+
+note: acceptance is greedy-argmax verification; at the shipped defaults the gate
+      only changes WHICH tokens are drafted (speed), never which are emitted —
+      zero quality loss. With EDGEML_ALLOW_WIDE_CPU=1 the CPU ids may differ from
+      the width-1 baseline: still a VALID greedy stream (no quality loss), just no
+      longer bit-identical to width-1. Metal is unaffected by the clamp either way.
 
 --------------------------------------------------------------------------------
  GATE 3a — proposer/guard self-test (model-free)                        [PASS]
@@ -66,108 +108,111 @@ note: acceptance is greedy-argmax verification, so the gate only changes WHICH
 cmd: EDGEML_SELFTEST=1 build/bin/llama-edgeml-lookup
 out: [1]  repetitive continuation exact: 4/4
      [1b] gate: strong->draft(score=32) 1 ; high-gate->empty 1
-     [2]  propose latency on 8k index: median 0.506 us/call   (gate: < 50 us)
+     [2]  propose latency on 8k index: median 0.403 us/call   (gate: < 50 us)
      [3]  guard on starvation: disabled=1 at=194 ema=0.0023 (< thr 0.1250)
-          healthy stream: drafting stays enabled
+     [4]  cpu width clamp (cpu 8->2 ; gpu/opt-out keep 8): 1
      SELF-TEST OK
-note: [1b] confirms the confidence gate — a strong match (score 32) drafts; an
-      unreachable gate suppresses drafting (falls back to width-1 == baseline).
-      [3] confirms the HARD no-regression guard fires under pure starvation.
+note: [1b] confirms the confidence gate (score 32 drafts; unreachable gate -> empty
+      -> width-1 == baseline). [3] confirms the HARD no-regression guard fires under
+      starvation. [4] is NEW: verifies the CPU width clamp (cpu 8->2; gpu and
+      opt-out keep 8) — the Gate-2 fix, checked with no model loaded.
 
 --------------------------------------------------------------------------------
- GATE 3b — repetitive/code speedup >= 1.2x  (MEASURED)                  [PASS]
+ GATE 3b — repetitive/code speedup >= 1.2x  (MEASURED)
 --------------------------------------------------------------------------------
-cmd: COOLDOWN=6 BIN=... MODEL=... \
-     examples/edgeml-lookup/bench/bench_toks.sh \
-     examples/edgeml-lookup/bench/prompts/code_repetitive.txt 512 5 99
+  Metal (-ngl 99), D=8 .......................................... PASS  (1.514x)
+  CPU   (-ngl 0),  D=2 (bit-exact clamp) ........... MEASURED NEAR-MISS (1.181x)
+
+METAL (primary, dedicated cooled run):
+cmd: COOLDOWN=6 BIN=... MODEL=... bench_toks.sh prompts/code_repetitive.txt 512 5 99
 out: OFF tok/s : 44.5508 42.7306 41.0759 38.4893 48.4813   -> median 42.7306
      ON  tok/s : 64.7082 63.3100 65.0486 64.7899 63.6454   -> median 64.7082
-     speedup   : 1.514x   (ON/OFF median, interleaved trials)     >= 1.2x  OK
-     accept_rate: 0.6638
-     multiple   : 2.5098   (committed / forward_calls)
-     draft_steps: 58       (steps that issued a wide draft batch)
-     drafting_enabled: 1   disabled_at: -1
-corroboration (independent cooled run, 600s idle lead, median-of-7):
-     repetitive speedup 1.741x  (OFF 36.3949 / ON 63.3727)  [run b1k8zxmo9]
+     speedup   : 1.514x   (>= 1.2x  OK)
+     accept_rate 0.6638 ; multiple 2.5098 ; draft_steps 58 ; drafting_enabled 1
+     re-confirm on the FIXED binary (same cmd, end of a hot batch): 1.332x
+       (OFF 48.6882 / ON 64.8288) — fix is a no-op on Metal; ratio within thermal
+       variance. corroboration (earlier cooled median-of-7): 1.741x [run b1k8zxmo9].
+
+CPU (bit-exact clamp, effective D=2):
+cmd: COOLDOWN=6 BIN=... MODEL=... bench_toks.sh prompts/code_repetitive.txt 512 5 0
+out: OFF tok/s : 48.1102 45.4400 46.1967 45.7832 46.9911   -> median 46.1967
+     ON  tok/s : 54.7303 54.8614 54.5383 52.8835 53.0743   -> median 54.5383
+     speedup   : 1.181x   (target >= 1.2x -> MISSES by ~1.6%)
+     accept_rate 0.8657 ; multiple 1.8286 ; draft_steps 134 ; drafting_enabled 1
+CPU opt-out (EDGEML_ALLOW_WIDE_CPU=1, D=8 -- NOT bit-exact; what the clamp gives up):
+cmd: EDGEML_ALLOW_WIDE_CPU=1 COOLDOWN=6 ... bench_toks.sh prompts/code_repetitive.txt 512 5 0
+out: OFF tok/s : 47.2446 ... -> median 47.2446 ; ON -> median 62.1293
+     speedup   : 1.315x   (accept_rate 0.6638 ; multiple 2.5098 ; draft_steps 58)
+WHY CPU misses: CPU decode here is ~46-54 tok/s (Accelerate path) — compute-bound,
+     not bandwidth-bound, so verifying D+1 tokens in one forward is NOT ~free (it
+     costs ~proportional to width). Clamping D to 2 caps tokens/forward (multiple
+     1.83 vs 2.51 at D=8), so the bit-exact setting lands just under 1.2x. This is
+     the measured cost of choosing bit-exactness over raw speed on CPU, WITHOUT
+     modifying core ggml (out of scope). Not tuned to hide.
 
 --------------------------------------------------------------------------------
- GATE 4 — novel-prose tok/s >= 0.98x baseline (no regression)          [PASS]
+ GATE 4 — novel-prose tok/s >= 0.98x baseline (no regression)  (MEASURED)
 --------------------------------------------------------------------------------
-cmd: COOLDOWN=6 BIN=... MODEL=... \
-     examples/edgeml-lookup/bench/bench_toks.sh \
-     examples/edgeml-lookup/bench/prompts/prose_novel.txt 512 5 99
+  Metal (-ngl 99), D=8 .......................................... PASS  (1.013x)
+  CPU   (-ngl 0),  D=2 (bit-exact clamp) ........... MEASURED NEAR-MISS (0.974x)
+
+METAL (primary, dedicated cooled run):
+cmd: COOLDOWN=6 BIN=... MODEL=... bench_toks.sh prompts/prose_novel.txt 512 5 99
 out: OFF tok/s : 42.1628 46.2154 43.0017 36.0668 46.5631   -> median 43.0017
      ON  tok/s : 43.5603 44.4781 43.2416 40.6084 44.0218   -> median 43.5603
-     speedup   : 1.013x   (ON/OFF median, interleaved trials)    >= 0.98x  OK
-     accept_rate: 0.3333
-     multiple   : 1.0179   (committed / forward_calls)
-     draft_steps: 3        (only 3 of ~500 steps drafted; gate suppressed the rest)
-     drafting_enabled: 1   disabled_at: -1
-note: the confidence gate (min_score=5) suppresses weak/coincidental matches, so
-      on novel prose almost no wide batches are issued (3 draft_steps) and tok/s
-      is at baseline. corroboration: 0.994x [sweep b04u1477g], 1.005x [cooled
-      b1k8zxmo9]. Across runs novel sits at 0.99x-1.01x.
+     speedup   : 1.013x   (>= 0.98x  OK)
+     accept_rate 0.3333 ; multiple 1.0179 ; draft_steps 3 (of ~500) ; drafting_enabled 1
+     re-confirm on the FIXED binary (same cmd): 0.998x (OFF 46.2060 / ON 46.1170).
+     corroboration: 0.994x [sweep b04u1477g], 1.005x [cooled b1k8zxmo9].
+
+CPU (bit-exact clamp, effective D=2):
+cmd: COOLDOWN=6 BIN=... MODEL=... bench_toks.sh prompts/prose_novel.txt 512 5 0
+out: OFF tok/s : 42.8305 46.2367 47.9407 47.9525 47.9686   -> median 47.9407
+     ON  tok/s : 48.7583 46.4532 46.4832 48.3753 46.7076   -> median 46.7076
+     speedup   : 0.974x   (target >= 0.98x -> MISSES; ~2.6% regression)
+     accept_rate 0.7500 ; multiple 1.0261 ; draft_steps 8 ; drafting_enabled 1
+note: on novel prose the confidence gate suppresses almost all drafts (8 of ~500
+     steps), so ON ~= OFF; on the compute-bound CPU the few width-3 verify batches
+     that ARE issued cost slightly more than the tokens they save -> a small (~2.6%)
+     regression. On Metal the same batches are ~free, so Metal stays at 0.998-1.013x.
+     Reported as measured; the guard is NOT re-tuned to mask it.
 
 --------------------------------------------------------------------------------
- GATE 5 — peak RSS within +2% (via /usr/bin/time -l)                   [PASS]
+ GATE 5 — peak RSS within +2% (via /usr/bin/time -l)                    [PASS]
 --------------------------------------------------------------------------------
 cmd: EDGEML_QUIET=1 [EDGEML_DRAFT_OFF=1] /usr/bin/time -l \
      build/bin/llama-edgeml-lookup -m qwen-1.7b.gguf \
-     -f .../code_repetitive.txt -n 512 -c 2048 -ngl 99 -t 4
-     (peak = "maximum resident set size"; 3 interleaved samples per condition)
-out: OFF peak RSS bytes : 1130954752  1170817024  1170407424
-                          (1078.6 MiB) (1116.6 MiB) (1116.2 MiB)   median 1116.2 MiB
-     ON  peak RSS bytes : 1175912448  1156841472  1175977984
-                          (1121.4 MiB) (1103.3 MiB) (1121.5 MiB)   median 1121.4 MiB
-     delta(median)     : +0.470%   (ON 1121.4 / OFF 1116.2 MiB)    <= +2%  OK
-     delta(worst-case) : +3.981%   (ON-max 1121.5 / OFF-min 1078.6 MiB)
-HONEST NOTE on this gate:
-  * No draft model is loaded — there is no second set of weights. The proposer
-    itself is a rolling-hash index of ints (a few KiB for a 512-token run).
-  * The only real growth is Metal COMPUTE SCRATCH: ON submits up-to-(D+1)=9-wide
-    verification batches, so the backend sizes its compute buffer to the widest
-    batch; OFF only ever submits width-1. That structural delta is ~5 MiB here
-    (ON median 1121.4 vs OFF median 1116.2 MiB = +0.470%).
-  * Peak RSS is NOISY on the OFF side (single OFF samples ranged 1076-1171 MiB
-    across all runs; ON is stable ~1121 MiB). A single OFF sample that lands low
-    can therefore show up to ~+4% (worst-case pairing above, and earlier single-
-    sample runs measured +4.4%). The 3-sample MEDIAN (+0.470%) is the robust
-    figure and is within the +2% gate. Both the median and the worst-case are
-    reported here rather than picking the favorable one.
-  * This delta does NOT depend on min_score (n_outputs_max is sized by D for both
-    ON and OFF); it is purely the width of the verify batch.
+     -f .../code_repetitive.txt -n 512 -c 2048 -ngl 99 -t 4    (Metal; 3 samples/cond)
+out: OFF peak RSS : median 1116.2 MiB   (1130954752 1170817024 1170407424 bytes)
+     ON  peak RSS : median 1121.4 MiB   (1175912448 1156841472 1175977984 bytes)
+     delta(median)     : +0.470%   (<= +2%  OK)
+     delta(worst-case) : +3.981%   (ON-max 1121.5 / OFF-min 1078.6 MiB; OFF-side noise)
+note: no draft model is loaded — the only real growth is compute scratch for the
+      up-to-(D+1)-wide verify batch. On CPU the clamp makes that batch NARROWER
+      (D=2 -> width 3) than Metal's (D=8 -> width 9), so the CPU RSS delta is <=
+      the Metal figure by construction. CPU peak-RSS delta: UNMEASURED this session
+      (not re-run under /usr/bin/time on -ngl 0). Not estimated.
 
 --------------------------------------------------------------------------------
- GATE 6 — every number carries its exact command                       [PASS]
+ GATE 6 — every number carries its exact command                        [PASS]
 --------------------------------------------------------------------------------
-This file. Each measurement above lists the literal command that produced it;
-unmeasured items are marked UNMEASURED (see 7B-class below).
+This file. Each measurement lists the literal command that produced it; unmeasured
+items are the literal string UNMEASURED (CPU peak RSS; 7B-class).
 
 --------------------------------------------------------------------------------
- WHY THE GATE EXISTS — ungated contrast (EDGEML_MIN_SCORE=0)
+ WHY THE GATE EXISTS — ungated contrast (EDGEML_MIN_SCORE=0)  [Metal]
 --------------------------------------------------------------------------------
-The confidence gate is the no-regression mechanism. With it DISABLED, the
-proposer drafts on weak/coincidental matches; on novel prose those wide batches
-are mostly rejected, so wall-clock REGRESSES even though the output stays
-bit-exact. This is the regression the task asked to be reported, not hidden.
-
-current binary, EDGEML_MIN_SCORE=0, same interleaved median-of-5 protocol:
-  cmd: EDGEML_MIN_SCORE=0 COOLDOWN=6 BIN=... MODEL=... bench_toks.sh <prompt> 512 5 99
+The confidence gate is the no-regression mechanism. With it DISABLED the proposer
+drafts on weak/coincidental matches; on novel prose those wide batches are mostly
+rejected, so wall-clock REGRESSES even though the output stays bit-exact.
+cmd: EDGEML_MIN_SCORE=0 COOLDOWN=6 ... bench_toks.sh <prompt> 512 5 99
   novel      : 0.711x  REGRESSION (fails >=0.98x)   OFF 47.9089 / ON 34.0403
-               accept_rate 0.0552, multiple 1.0825, draft_steps 86
   repetitive : 1.583x                               OFF 32.4766 / ON 51.4084
-               accept_rate 0.5826, multiple 3.9084, draft_steps 83
-  => disabling the gate speeds up repetitive (1.58x) but REGRESSES novel to 0.711x.
-     The gate (min_score=5) keeps repetitive at 1.514x while lifting novel to 1.013x.
-
-corroboration (earlier pre-gate build, run bzbapl4lr):
-  novel      : 0.731x  (OFF 43.6903 / ON 31.9356; accept_rate 0.0552, multiple 1.0825)
-  repetitive : 1.349x  (OFF 47.3030 / ON 63.8017; accept_rate 0.5826, multiple 3.9084)
-
-Default min_score was chosen from a measured sweep (run b04u1477g): at
-min_score=4 novel is 0.968x (FAILS the >=0.98x gate) while at min_score=5 novel
-is 0.994x (PASSES) and repetitive still 1.516x. Hence the baked default of 5.
-min_score<=2 disables the gate (the ungated path above).
+  => disabling the gate speeds repetitive but REGRESSES novel to 0.711x; the gate
+     (min_score=5) keeps repetitive at 1.514x while holding novel at 1.013x (Metal).
+Default min_score chosen from a measured sweep [run b04u1477g]: min_score=4 -> novel
+0.968x (FAILS); min_score=5 -> novel 0.994x (PASSES), repetitive 1.516x. min_score<=2
+disables the gate. (All on Metal.)
 
 --------------------------------------------------------------------------------
  7B-class model
@@ -180,10 +225,27 @@ Not estimated.
  SUMMARY
 --------------------------------------------------------------------------------
  Gate 1  clean build, no new warnings ............................ PASS
- Gate 2  bit-exact greedy ids (11/11 prompts) .................... PASS
- Gate 3  repetitive speedup 1.514x (>= 1.2x) + self-test ......... PASS
- Gate 4  novel tok/s 1.013x (>= 0.98x) ........................... PASS
- Gate 5  peak RSS +0.470% median-of-3 (<= +2%) ................... PASS  (worst-case +3.98%)
+ Gate 2  bit-exact greedy ids (per-backend x per-D matrix) ....... PASS
+           - bitexact.sh 128 0  (CPU,  shipped clamp D<=2) : 11/11 IDENTICAL
+           - bitexact.sh 128 99 (Metal, D=8)               : 11/11 IDENTICAL
+           - per-D: CPU exact D<=2, diverges D>=3 ; Metal exact all D
+ Gate 3a proposer/guard self-test (incl. new CPU-clamp check) .... PASS
+ Gate 3b repetitive speedup >= 1.2x
+           Metal D=8 : 1.514x (re-confirm 1.332x) ................ PASS
+           CPU   D=2 : 1.181x (bit-exact clamp) ........ MEASURED NEAR-MISS
+                       opt-out D=8 = 1.315x (NOT bit-exact)
+ Gate 4  novel tok/s >= 0.98x
+           Metal D=8 : 1.013x (re-confirm 0.998x) ................ PASS
+           CPU   D=2 : 0.974x (bit-exact clamp) ........ MEASURED NEAR-MISS (~2.6% regr.)
+ Gate 5  peak RSS +0.470% median-of-3 (Metal) <= +2% ............. PASS  (CPU RSS UNMEASURED)
  Gate 6  every number has its command ............................ PASS
  7B-class ........................................................ UNMEASURED
+
+ BOTTOM LINE: the reported bug — CPU bit-exactness failing at D>=3 — is FIXED and
+ re-verified (Gate 2: CPU 11/11 at the shipped clamp; per-D boundary confirmed).
+ Metal is unchanged (all gates PASS). The clamp that guarantees CPU bit-exactness
+ costs speed on the compute-bound CPU backend, so the CPU speed gates are a MEASURED
+ near-miss (repetitive 1.181x < 1.2x ; novel 0.974x < 0.98x). This is an inherent
+ correctness-vs-speed trade-off given the "no core ggml changes" constraint, not a
+ tuning artifact; EDGEML_ALLOW_WIDE_CPU=1 trades bit-exactness back for 1.315x on CPU.
 ================================================================================

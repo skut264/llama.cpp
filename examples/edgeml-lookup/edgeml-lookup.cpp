@@ -13,7 +13,14 @@
 //
 // Extra knobs (env vars, to keep the patch confined to examples/):
 //   EDGEML_DRAFT_OFF=1     run the greedy baseline (drafting disabled) — for ON/OFF
-//   EDGEML_D=8             max draft length D (default 8)
+//   EDGEML_D=8             max draft length D (default 8; the CPU backend clamps
+//                          this — see EDGEML_ALLOW_WIDE_CPU / EDGEML_CPU_SAFE_D)
+//   EDGEML_ALLOW_WIDE_CPU=1 on the CPU backend (n_gpu_layers==0, i.e. -ngl 0) do NOT clamp D.
+//                          Faster on CPU, but a wide CPU batch reorders FP
+//                          reductions so greedy ids may differ from the width-1
+//                          baseline (CPU bit-exactness holds only up to width 3).
+//   EDGEML_CPU_SAFE_D=2    max draft width used on the CPU backend when not
+//                          overridden; measured bit-exact up to 2. Metal: no clamp.
 //   EDGEML_MIN_SCORE=5     confidence gate: only draft matches whose score
 //                          (match_length x recency) >= this. Default 5, chosen from
 //                          a measured sweep: novel prose stays >=0.98x (0.994x at 5
@@ -72,6 +79,18 @@ static llama_token greedy_argmax(llama_context * ctx, int idx, int n_vocab) {
         if (lg[v] > bv) { bv = lg[v]; best = v; }
     }
     return best;
+}
+
+// Effective draft width. On the CPU backend a wide (>=4-wide) batched decode
+// reorders the logits FP reductions vs width-1 and can flip a near-tie greedy
+// argmax (spec ids drift from the width-1 baseline). Measured bit-exact up to
+// batch width 3 (D<=2) on the ggml CPU path; Metal is bit-exact at all D. So on
+// the CPU path clamp D to cpu_safe_d unless the user opts out. Pure function so
+// the self-test can check it model-free.
+static int effective_draft_width(int d_req, bool cpu_backend, bool allow_wide_cpu, int cpu_safe_d) {
+    int d = d_req < 1 ? 1 : d_req;
+    if (cpu_backend && !allow_wide_cpu && d > cpu_safe_d) d = cpu_safe_d;
+    return d;
 }
 
 // --------------------------------------------------------------------------- //
@@ -168,6 +187,21 @@ static int run_selftest() {
         if (!g2.drafting_enabled()) { fprintf(stderr, "  [3] FAIL: guard disabled on a healthy stream\n"); fails++; }
     }
 
+    // (4) CPU width clamp keeps bit-exactness by construction on the CPU path:
+    // on CPU a draft width above the safe bound is clamped; GPU and the explicit
+    // opt-out are left untouched.
+    {
+        const int S = 2;
+        const bool ok =
+            effective_draft_width(8, /*cpu=*/true,  /*allow=*/false, S) == S &&  // cpu: 8 -> 2
+            effective_draft_width(8, /*cpu=*/false, /*allow=*/false, S) == 8 &&  // gpu: unchanged
+            effective_draft_width(8, /*cpu=*/true,  /*allow=*/true,  S) == 8 &&  // opt-out: unchanged
+            effective_draft_width(2, /*cpu=*/true,  /*allow=*/false, S) == 2 &&  // already safe
+            effective_draft_width(1, /*cpu=*/true,  /*allow=*/false, S) == 1;    // min width
+        fprintf(stderr, "  [4] cpu width clamp (cpu 8->2 ; gpu/opt-out keep 8): %s\n", ok ? "1" : "0 FAIL");
+        if (!ok) fails++;
+    }
+
     fprintf(stderr, "%s\n", fails == 0 ? "SELF-TEST OK" : "SELF-TEST FAILED");
     return fails == 0 ? 0 : 1;
 }
@@ -190,8 +224,28 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    const int   D              = std::max(1, env_int("EDGEML_D", 8));
+    const int   D_req          = std::max(1, env_int("EDGEML_D", 8));
     const bool  draft_off      = env_flag("EDGEML_DRAFT_OFF");
+    // --- CPU-backend bit-exactness clamp -------------------------------------
+    // A wide (>=4-wide) batched decode on the ggml CPU matmul path reduces the
+    // logits dot-products in a different order than a width-1 decode; that can
+    // flip a near-tie greedy argmax and make the spec token stream drift from the
+    // width-1 baseline (measured: bit-exact up to batch width 3, i.e. D<=2; breaks
+    // at D>=3). Metal is bit-exact at all D. So when nothing is offloaded to the
+    // GPU (n_gpu_layers==0, i.e. -ngl 0) clamp the draft width to EDGEML_CPU_SAFE_D (default 2)
+    // unless the user explicitly opts out. This keeps Gate-2 (spec ids == greedy
+    // ids) true BY CONSTRUCTION on the CPU backend instead of by luck.
+    const bool  cpu_backend    = (params.n_gpu_layers == 0);  // -ngl 0: the measured CPU path (auto=-1 / all=-2 offload to GPU)
+    const bool  allow_wide_cpu = env_flag("EDGEML_ALLOW_WIDE_CPU");
+    const int   cpu_safe_d     = std::max(1, env_int("EDGEML_CPU_SAFE_D", 2));
+    const int   D              = effective_draft_width(D_req, cpu_backend, allow_wide_cpu, cpu_safe_d);
+    const bool  cpu_clamped    = (D != D_req);
+    if (cpu_clamped) {
+        LOG_INF("EDGEML: CPU backend (n_gpu_layers=%d) -> clamping draft width D %d -> %d for bit-exactness; "
+                "wide CPU batches reorder FP reductions and can flip a near-tie argmax at width>=4. "
+                "Set EDGEML_ALLOW_WIDE_CPU=1 to keep D=%d (faster, but greedy ids may differ from the width-1 baseline).\n",
+                params.n_gpu_layers, D_req, D, D_req);
+    }
     const int   min_score      = std::max(0, env_int("EDGEML_MIN_SCORE", 5));
     const int   warmup         = std::max(0, env_int("EDGEML_WARMUP", 64));
     const int   no_regress     = std::max(1, env_int("EDGEML_NO_REGRESS", 128));
@@ -336,6 +390,9 @@ int main(int argc, char ** argv) {
     LOG_INF("\n");
     LOG_INF("EDGEML mode             = %s\n", mode);
     LOG_INF("EDGEML D                = %d\n", D);
+    LOG_INF("EDGEML D_requested      = %d\n", D_req);
+    LOG_INF("EDGEML backend          = %s (n_gpu_layers=%d)\n", cpu_backend ? "cpu" : "gpu", params.n_gpu_layers);
+    LOG_INF("EDGEML cpu_clamped      = %d\n", (int) cpu_clamped);
     LOG_INF("EDGEML min_score        = %d\n", min_score);
     LOG_INF("EDGEML n_predict        = %d\n", n_predict);
     LOG_INF("EDGEML forward_calls    = %ld\n", forward_calls);
@@ -362,6 +419,9 @@ int main(int argc, char ** argv) {
         f << "{"
           << "\"mode\":\"" << mode << "\","
           << "\"D\":" << D << ","
+          << "\"D_requested\":" << D_req << ","
+          << "\"cpu_backend\":" << (int) cpu_backend << ","
+          << "\"cpu_clamped\":" << (int) cpu_clamped << ","
           << "\"min_score\":" << min_score << ","
           << "\"n_predict\":" << n_predict << ","
           << "\"forward_calls\":" << forward_calls << ","
