@@ -1,0 +1,6 @@
+Q: What is the capital of Japan?
+A: Tokyo.
+Q: What is the capital of France?
+A: Paris.
+Q: What is the capital of Italy?
+A:
