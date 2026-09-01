@@ -57,6 +57,9 @@ EDGEML_SELFTEST=1 ./build/bin/llama-edgeml-lookup
 
 # greedy baseline (drafting OFF) — identical tokens, one forward per token
 EDGEML_DRAFT_OFF=1 ./build/bin/llama-edgeml-lookup -m qwen-1.7b.gguf -f prompt.txt -n 512 -c 2048 -ngl 99
+
+# set the draft length D via the idiomatic speculative flag (EDGEML_D=<n> is an env alias/override)
+./build/bin/llama-edgeml-lookup -m qwen-1.7b.gguf -f prompt.txt -n 512 -c 2048 -ngl 99 --spec-draft-n-max 8
 ```
 
 Decoding is **pure greedy** (argmax over the target logits). On the GPU/Metal
@@ -87,7 +90,7 @@ All extra configuration is via env vars, to keep the patch confined to `examples
 | Env var             | Default | Meaning                                                        |
 |---------------------|---------|----------------------------------------------------------------|
 | `EDGEML_DRAFT_OFF`  | unset   | `1` = greedy baseline (drafting disabled)                      |
-| `EDGEML_D`          | `8`     | max draft length D (clamped on the CPU backend — see below)    |
+| `EDGEML_D`          | `8`     | max draft length D — env alias/override for the `--spec-draft-n-max` CLI flag (clamped on the CPU backend — see below)    |
 | `EDGEML_ALLOW_WIDE_CPU` | unset | `1` = on the CPU backend (`-ngl 0`) do **not** clamp D. Faster, but greedy ids may differ from the width-1 baseline (see "CPU backend bit-exactness") |
 | `EDGEML_CPU_SAFE_D` | `2`     | max draft width used on the CPU backend (`-ngl 0`) when not overridden; measured bit-exact up to 2. Metal is unaffected (no clamp) |
 | `EDGEML_MIN_SCORE`  | `5`     | confidence gate: only draft matches with score >= this (primary no-regression knob; `<=2` disables it) |
@@ -100,6 +103,10 @@ All extra configuration is via env vars, to keep the patch confined to `examples
 | `EDGEML_SELFTEST`   | unset   | `1` = run the model-free proposer self-test and exit          |
 
 ## Reproduce the validation tables
+
+> `BENCHMARKS.md` has the digested result tables, the per-backend × per-`D`
+> bit-exactness matrix, and the cross-hardware trend; `VALIDATION.txt` keeps the
+> raw runs with the exact command behind every number.
 
 ```sh
 export BIN=$PWD/build/bin/llama-edgeml-lookup

@@ -13,8 +13,9 @@
 //
 // Extra knobs (env vars, to keep the patch confined to examples/):
 //   EDGEML_DRAFT_OFF=1     run the greedy baseline (drafting disabled) — for ON/OFF
-//   EDGEML_D=8             max draft length D (default 8; the CPU backend clamps
-//                          this — see EDGEML_ALLOW_WIDE_CPU / EDGEML_CPU_SAFE_D)
+//   --spec-draft-n-max N   max draft length D (idiomatic CLI flag; default 8). The
+//                          CPU backend clamps this (see EDGEML_ALLOW_WIDE_CPU /
+//                          EDGEML_CPU_SAFE_D). EDGEML_D=N is an env alias/override.
 //   EDGEML_ALLOW_WIDE_CPU=1 on the CPU backend (n_gpu_layers==0, i.e. -ngl 0) do NOT clamp D.
 //                          Faster on CPU, but a wide CPU batch reorders FP
 //                          reductions so greedy ids may differ from the width-1
@@ -220,11 +221,19 @@ int main(int argc, char ** argv) {
     common_params params;
     common_init();
 
+    // D (max draft length) is settable via the idiomatic speculative flag
+    // --spec-draft-n-max (which is LLAMA_EXAMPLE_LOOKUP-scoped). Pre-seed our
+    // default of 8 over the common default (3) so that "no flag given" keeps the
+    // validated D=8 behaviour; an explicit --spec-draft-n-max overrides it.
+    params.speculative.draft.n_max = 8;
+
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_LOOKUP)) {
         return 1;
     }
 
-    const int   D_req          = std::max(1, env_int("EDGEML_D", 8));
+    // D_req: --spec-draft-n-max (pre-seeded to 8 above) is the base; the EDGEML_D
+    // env var overrides it for backward-compat with the validation scripts.
+    const int   D_req          = std::max(1, env_int("EDGEML_D", params.speculative.draft.n_max));
     const bool  draft_off      = env_flag("EDGEML_DRAFT_OFF");
     // --- CPU-backend bit-exactness clamp -------------------------------------
     // A wide (>=4-wide) batched decode on the ggml CPU matmul path reduces the
