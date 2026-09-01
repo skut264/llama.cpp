@@ -40,8 +40,39 @@ namespace edgeml {
 static const uint64_t NG_MOD  = ((uint64_t)1 << 61) - 1;
 static const uint64_t NG_BASE = 0x9E3779B1ull;
 
+// (a*b) mod NG_MOD. Prefer the single-instruction 128-bit widening multiply where
+// the compiler offers it; fall back to a portable 64-bit shift-add mulmod elsewhere.
+// The two paths are numerically identical (exact modular multiply), so the hash —
+// and therefore every draft and the emitted token stream — is unchanged either way.
+// `__int128` is a compiler extension, so its single use is wrapped to stay clean
+// under -Wpedantic (the alias name, not the keyword, is what the code below uses).
+#if defined(__SIZEOF_INT128__)
+#  if defined(__GNUC__) || defined(__clang__)
+#    pragma GCC diagnostic push
+#    pragma GCC diagnostic ignored "-Wpedantic"
+#  endif
+using ng_u128 = unsigned __int128;
+#  if defined(__GNUC__) || defined(__clang__)
+#    pragma GCC diagnostic pop
+#  endif
+#endif
+
 static inline uint64_t ng_mulmod(uint64_t a, uint64_t b) {
-    return (uint64_t)(((unsigned __int128)a * (unsigned __int128)b) % NG_MOD);
+#if defined(__SIZEOF_INT128__)
+    return (uint64_t)((ng_u128) a * (ng_u128) b % NG_MOD);
+#else
+    // portable 64-bit mulmod (no 128-bit type): binary shift-add under the modulus.
+    // NG_MOD < 2^61 keeps every intermediate (2*a, result+a) well within uint64_t,
+    // so a single conditional subtraction fully reduces each step.
+    uint64_t result = 0;
+    a %= NG_MOD;
+    while (b) {
+        if (b & 1u) { result += a; if (result >= NG_MOD) result -= NG_MOD; }
+        a <<= 1;    if (a >= NG_MOD) a -= NG_MOD;
+        b >>= 1;
+    }
+    return result;
+#endif
 }
 
 // Incremental rolling-hash index of the observed token stream (positions where

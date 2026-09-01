@@ -11,7 +11,8 @@ Speculative decoding without a second model. Each step:
 
 1. **Propose** — a rolling-hash n-gram index over the prompt + generated suffix
    (orders n=3 then n=2) finds where the current context tail recently occurred and
-   copies the literal continuation as a draft of up to `D` (default 8) tokens.
+   copies the literal continuation as a draft of up to `D` (default 8, set via
+   `--spec-draft-n-max` or `EDGEML_D`) tokens.
    Candidates are fused by **match_length × recency** (a bounded sliding-max). This
    is O(1) in context length — only the last ~35 tokens are ever inspected.
 2. **Verify** — one batched forward over the `D+1` draft slots; longest-prefix
@@ -49,8 +50,9 @@ What this example adds that is **not** in-tree:
 
 ## Honest results (Qwen2.5-1.7B-Instruct Q4_K_M, M1)
 
-See `VALIDATION.txt` for the full tables with the exact command behind every
-number. Headline (measured; no interpolation):
+See `VALIDATION.txt` for the raw runs (the exact command behind every number) and
+`BENCHMARKS.md` for the digested result tables + the cross-hardware trend.
+Headline (measured; no interpolation):
 
 ### Metal (`-ngl 99`) — primary validated backend, D=8
 
@@ -133,6 +135,7 @@ examples/edgeml-lookup/
 ├── BUILD.md              # exact build + run + reproduce commands
 ├── README.md             # this file
 ├── VALIDATION.txt        # measured tables; every number carries its command
+├── BENCHMARKS.md         # digested tables + per-backend×per-D matrix + cross-hardware trend
 └── bench/
     ├── bitexact.sh       # spec ids == greedy ids over the 10+ prompts
     ├── bench_toks.sh     # tok/s ON vs OFF, >=512 tok, median of 5
