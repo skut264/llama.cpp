@@ -1,0 +1,30 @@
+Below are REST route handlers following one exact repeating pattern. Continue the pattern for the next 60 items, changing only the integer, and do not add commentary.
+
+@app.route("/api/v1/item/0", methods=["GET"])
+def get_item_0():
+    record = db.query("SELECT * FROM items WHERE id = 0")
+    if record is None:
+        return jsonify({"error": "not found", "id": 0}), 404
+    return jsonify({"ok": True, "id": 0, "data": record}), 200
+
+@app.route("/api/v1/item/1", methods=["GET"])
+def get_item_1():
+    record = db.query("SELECT * FROM items WHERE id = 1")
+    if record is None:
+        return jsonify({"error": "not found", "id": 1}), 404
+    return jsonify({"ok": True, "id": 1, "data": record}), 200
+
+@app.route("/api/v1/item/2", methods=["GET"])
+def get_item_2():
+    record = db.query("SELECT * FROM items WHERE id = 2")
+    if record is None:
+        return jsonify({"error": "not found", "id": 2}), 404
+    return jsonify({"ok": True, "id": 2, "data": record}), 200
+
+@app.route("/api/v1/item/3", methods=["GET"])
+def get_item_3():
+    record = db.query("SELECT * FROM items WHERE id = 3")
+    if record is None:
+        return jsonify({"error": "not found", "id": 3}), 404
+    return jsonify({"ok": True, "id": 3, "data": record}), 200
+
