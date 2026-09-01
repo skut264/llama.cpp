@@ -10,7 +10,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 N="${1:-128}"; NGL="${2:-99}"; C="${3:-2048}"; T="${4:-4}"
 tmp="$(mktemp -d)"; pass=0; total=0
 printf '%-10s %-8s %s\n' "prompt" "n_ids" "result"
-for p in "$HERE"/prompts/p*.txt; do
+for p in "$HERE"/prompts/p??.txt "$HERE"/prompts/prose_novel.txt; do  # p01..p10 + prose_novel = 11 distinct (p??=2 chars, so it does NOT re-match prose_novel)
   name="$(basename "$p")"; total=$((total+1))
   EDGEML_QUIET=1 EDGEML_DUMP_IDS="$tmp/on.ids"  "$BIN" -m "$MODEL" -f "$p" -n "$N" -c "$C" -ngl "$NGL" -t "$T" >/dev/null 2>&1
   EDGEML_QUIET=1 EDGEML_DRAFT_OFF=1 EDGEML_DUMP_IDS="$tmp/off.ids" "$BIN" -m "$MODEL" -f "$p" -n "$N" -c "$C" -ngl "$NGL" -t "$T" >/dev/null 2>&1
