@@ -249,3 +249,36 @@ Not estimated.
  correctness-vs-speed trade-off given the "no core ggml changes" constraint, not a
  tuning artifact; EDGEML_ALLOW_WIDE_CPU=1 trades bit-exactness back for 1.315x on CPU.
 ================================================================================
+
+--------------------------------------------------------------------------------
+ CLOSEOUT RE-VERIFICATION — upstream-hardening refactor (examples/-only)   [PASS]
+--------------------------------------------------------------------------------
+Refactor (compute path unchanged):
+  * ng_mulmod is now -Wpedantic-clean: its single `unsigned __int128` use is a
+    pragma-guarded alias with a portable 64-bit shift-add fallback. Both paths are
+    numerically identical, so the rolling hash — and the emitted token stream — is
+    unchanged.
+  * D is now settable via the idiomatic speculative flag --spec-draft-n-max
+    (LLAMA_EXAMPLE_LOOKUP-scoped); EDGEML_D stays as an env alias/override for
+    backward-compat with these scripts. Still examples/-only + the one
+    add_subdirectory line; no ggml / core / common edits.
+Re-verify on the REFACTORED binary:
+  cmd: cmake --build build --target llama-edgeml-lookup
+  out: [100%] Built target llama-edgeml-lookup   (clean)
+  cmd: clang++ -std=c++17 -Wpedantic -Werror -fsyntax-only <TU that #includes lookup-proposer.h>
+  out: PEDANTIC_CLEAN   (the __int128 pedantic warning is gone)
+  cmd: EDGEML_SELFTEST=1 build/bin/llama-edgeml-lookup
+  out: SELF-TEST OK  (incl [4] cpu clamp; propose latency median 0.377 us/call)
+  flag: --spec-draft-n-max 5 -> D=5 ; EDGEML_D=6 --spec-draft-n-max 5 -> D=6 (env wins) ;
+        --spec-draft-n-max 8 -ngl 0 -> D=2, cpu_clamped=1
+  cmd: bitexact.sh 128 0   -> 11/11 IDENTICAL  (CPU, shipped clamp D=2)
+  cmd: bitexact.sh 128 99  -> 11/11 IDENTICAL  (Metal, D=8)
+  cmd: bench_toks.sh prompts/code_repetitive.txt 512 3 99   (Metal, median-of-3, UNCOOLED spot-check)
+  out: OFF median 39.9569 / ON median 57.3738 -> 1.436x ; accept_rate 0.6638 ;
+       multiple 2.5098 ; draft_steps 58
+  read: the drafting dynamics (accept_rate 0.6638, multiple 2.5098) are IDENTICAL to the
+       validated cooled median-of-5 Metal run (Gate 3b: 0.6638 / 2.5098), i.e. the refactor
+       did not change speculation at all. Absolute tok/s is lower here only because this
+       quick n=3 spot-check had no cooldown right after the build+bitexact load (OFF also
+       fell, 39.96 vs 42.73). The canonical cooled median-of-5 figure stays 1.514x; this
+       uncooled n=3 run only corroborates "no regression", it does NOT replace the headline.
