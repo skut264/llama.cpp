@@ -71,6 +71,11 @@ static std::string env_str(const char * k) {
     const char * v = getenv(k);
     return v ? std::string(v) : std::string();
 }
+static double env_double(const char * k, double def) {
+    const char * v = getenv(k);
+    if (!v || !*v) return def;
+    return atof(v);
+}
 
 static llama_token greedy_argmax(llama_context * ctx, int idx, int n_vocab) {
     const float * lg = llama_get_logits_ith(ctx, idx);
@@ -245,15 +250,22 @@ int main(int argc, char ** argv) {
     // unless the user explicitly opts out. This keeps Gate-2 (spec ids == greedy
     // ids) true BY CONSTRUCTION on the CPU backend instead of by luck.
     const bool  cpu_backend    = (params.n_gpu_layers == 0);  // -ngl 0: the measured CPU path (auto=-1 / all=-2 offload to GPU)
+    // -ot "exps=CPU" keeps attention/shared/routers on Metal but runs the ROUTED
+    // EXPERT GEMV on the CPU. That FFN path has the same wide-batch FP-reduction
+    // reordering as full-CPU decode, so the D>=3 bit-exactness break applies even
+    // though n_gpu_layers=99. There is no libllama API to detect an -ot override
+    // from here, so the RUNBOOK sets EDGEML_OT=1 alongside -ot to re-arm the clamp.
+    const bool  ot_experts_cpu = env_flag("EDGEML_OT");
+    const bool  cpu_numerics   = cpu_backend || ot_experts_cpu;  // CPU FP path is live for the FFN
     const bool  allow_wide_cpu = env_flag("EDGEML_ALLOW_WIDE_CPU");
     const int   cpu_safe_d     = std::max(1, env_int("EDGEML_CPU_SAFE_D", 2));
-    const int   D              = effective_draft_width(D_req, cpu_backend, allow_wide_cpu, cpu_safe_d);
+    const int   D              = effective_draft_width(D_req, cpu_numerics, allow_wide_cpu, cpu_safe_d);
     const bool  cpu_clamped    = (D != D_req);
     if (cpu_clamped) {
-        LOG_INF("EDGEML: CPU backend (n_gpu_layers=%d) -> clamping draft width D %d -> %d for bit-exactness; "
-                "wide CPU batches reorder FP reductions and can flip a near-tie argmax at width>=4. "
+        LOG_INF("EDGEML: CPU numeric path active (n_gpu_layers=%d, EDGEML_OT=%d) -> clamping draft width D %d -> %d "
+                "for bit-exactness; wide CPU batches reorder FP reductions and can flip a near-tie argmax at width>=4. "
                 "Set EDGEML_ALLOW_WIDE_CPU=1 to keep D=%d (faster, but greedy ids may differ from the width-1 baseline).\n",
-                params.n_gpu_layers, D_req, D, D_req);
+                params.n_gpu_layers, (int) ot_experts_cpu, D_req, D, D_req);
     }
     const int   min_score      = std::max(0, env_int("EDGEML_MIN_SCORE", 5));
     const int   warmup         = std::max(0, env_int("EDGEML_WARMUP", 64));
@@ -262,6 +274,18 @@ int main(int argc, char ** argv) {
     const bool  quiet          = env_flag("EDGEML_QUIET");
     const std::string dump_ids = env_str("EDGEML_DUMP_IDS");
     const std::string json_out = env_str("EDGEML_STATS_JSON");
+
+    // --- adaptive draft-width lever (Moonlight-fast lane B) ------------------
+    // ON by default: D floats in [floor, D] driven by the guard EMA. Set
+    // EDGEML_ADAPTIVE=0 to pin the classic fixed width (D) — needed to produce the
+    // per-D bit-exactness matrix. `D` (above) is already the bit-exact ceiling, so
+    // the adaptive path can never exceed the CPU/-ot-safe width.
+    const bool   adaptive       = env_int("EDGEML_ADAPTIVE", 1) != 0;
+    const int    adapt_floor    = std::min(D, std::max(1, env_int("EDGEML_ADAPTIVE_FLOOR", 2)));
+    const long   adapt_commit   = std::max(1, env_int("EDGEML_ADAPTIVE_COMMIT", 64));
+    const double adapt_hi       = env_double("EDGEML_ADAPTIVE_HI", 0.80);
+    const double adapt_lo       = env_double("EDGEML_ADAPTIVE_LO", 0.50);
+    const int    adapt_step     = std::max(1, env_int("EDGEML_ADAPTIVE_STEP", 2));
 
     // configure the context to allow up to D+1 logits-producing positions per decode
     params.speculative.draft.n_max = D;
@@ -300,6 +324,8 @@ int main(int argc, char ** argv) {
     // proposer over the whole prompt + generated suffix
     edgeml::LookupProposer prop(D);
     edgeml::SpecGuard guard(D, ema_window, no_regress, warmup);
+    // Adaptive width floats in [adapt_floor, D]; ceiling D is the bit-exact width.
+    edgeml::AdaptiveWidth adapt(adapt_floor, /*ceil=*/D, adapt_commit, adapt_hi, adapt_lo, adapt_step);
     prop.observe(inp);
     bool drafting = !draft_off;
 
@@ -359,6 +385,9 @@ int main(int argc, char ** argv) {
         // update EMA / guard for the draft that was just verified
         if (prev_n_draft > 0) {
             guard.record(prev_n_draft, round_acc, round_commit, committed);
+            // adapt AFTER the guard so it sees this verify's EMA; attribution uses the
+            // width the draft was actually made at (adapt.width() unchanged until now).
+            if (adaptive) adapt.record(prev_n_draft, round_acc, round_commit, guard.ema(), committed);
             if (!guard.drafting_enabled()) drafting = false;
         }
         if (done) break;
@@ -366,10 +395,12 @@ int main(int argc, char ** argv) {
         // KV: drop any drafted tokens that were not accepted
         llama_memory_seq_rm(llama_get_memory(ctx), 0, n_past, -1);
 
-        // draft the continuation from the proposer (if drafting is enabled)
+        // draft the continuation from the proposer (if drafting is enabled).
+        // width is the adaptive current width (<= D) or the fixed ceiling D.
         if (drafting) {
             std::vector<llama_token> cont;
-            prop.propose(inp, D, cont, min_score);
+            const int d_now = adaptive ? adapt.width() : D;
+            prop.propose(inp, d_now, cont, min_score);
             for (llama_token t : cont) draft.push_back(t);
             if (cont.empty()) ++empty_proposes; else ++draft_steps;
         }
@@ -418,6 +449,34 @@ int main(int argc, char ** argv) {
     LOG_INF("EDGEML disabled_at      = %ld\n", guard.disabled_at());
     LOG_INF("EDGEML decode_tok_s     = %.4f\n", tok_s);
 
+    // adaptive-width telemetry (lane B): D trajectory + per-width accept/multiple
+    if (adaptive) {
+        std::string traj;
+        for (const auto & t : adapt.trajectory()) {
+            char seg[64];
+            snprintf(seg, sizeof(seg), "%s%c:%d->%d@%ld",
+                     traj.empty() ? "" : " ", t.reason, t.from, t.to, t.committed);
+            traj += seg;
+        }
+        LOG_INF("EDGEML adaptive         = 1\n");
+        LOG_INF("EDGEML D_floor          = %d\n", adapt.floor_width());
+        LOG_INF("EDGEML D_ceiling        = %d\n", adapt.ceil_width());
+        LOG_INF("EDGEML D_final          = %d\n", adapt.width());
+        LOG_INF("EDGEML escalations      = %ld\n", adapt.escalations());
+        LOG_INF("EDGEML deescalations    = %ld\n", adapt.deescalations());
+        LOG_INF("EDGEML D_trajectory     = %s\n", traj.c_str());
+        LOG_INF("EDGEML per-width [D: verifies commits drafts accepts accept_rate multiple]\n");
+        for (const auto & kv : adapt.per_width()) {
+            const auto & w = kv.second;
+            const double ar = w.drafts   ? (double) w.accepts / (double) w.drafts   : 0.0;
+            const double mp = w.verifies ? (double) w.commits / (double) w.verifies : 0.0;
+            LOG_INF("EDGEML   D=%d: verifies=%ld commits=%ld drafts=%ld accepts=%ld accept_rate=%.4f multiple=%.4f\n",
+                    kv.first, w.verifies, w.commits, w.drafts, w.accepts, ar, mp);
+        }
+    } else {
+        LOG_INF("EDGEML adaptive         = 0 (fixed width D=%d)\n", D);
+    }
+
     if (!dump_ids.empty()) {
         std::ofstream f(dump_ids);
         for (llama_token id : gen_ids) f << id << "\n";
@@ -445,8 +504,26 @@ int main(int argc, char ** argv) {
           << "\"multiple\":" << mult << ","
           << "\"drafting_enabled\":" << (int) guard.drafting_enabled() << ","
           << "\"disabled_at\":" << guard.disabled_at() << ","
-          << "\"decode_tok_s\":" << tok_s
-          << "}\n";
+          << "\"decode_tok_s\":" << tok_s << ","
+          << "\"adaptive\":" << (int) adaptive << ","
+          << "\"d_floor\":" << adapt.floor_width() << ","
+          << "\"d_ceiling\":" << adapt.ceil_width() << ","
+          << "\"d_final\":" << adapt.width() << ","
+          << "\"escalations\":" << adapt.escalations() << ","
+          << "\"deescalations\":" << adapt.deescalations() << ",";
+        f << "\"per_width\":[";
+        bool first_w = true;
+        for (const auto & kv : adapt.per_width()) {
+            const auto & w = kv.second;
+            const double ar = w.drafts   ? (double) w.accepts / (double) w.drafts   : 0.0;
+            const double mp = w.verifies ? (double) w.commits / (double) w.verifies : 0.0;
+            f << (first_w ? "" : ",") << "{\"d\":" << kv.first
+              << ",\"verifies\":" << w.verifies << ",\"commits\":" << w.commits
+              << ",\"drafts\":" << w.drafts << ",\"accepts\":" << w.accepts
+              << ",\"accept_rate\":" << ar << ",\"multiple\":" << mp << "}";
+            first_w = false;
+        }
+        f << "]}\n";
     }
 
     llama_batch_free(batch_tgt);
