@@ -1423,6 +1423,17 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
     }
 }
 
+// EdgeML: opt-in (EDGEML_EXPERT_MADVISE=1) MADV_RANDOM hint for routed-expert
+// tensors under mmap. Default OFF -> load path byte-identical to upstream. Cached
+// once: the environment cannot change during a single model load.
+static bool edgeml_expert_madvise_enabled() {
+    static const bool on = [] {
+        const char * s = getenv("EDGEML_EXPERT_MADVISE");
+        return s && s[0] && s[0] != '0';
+    }();
+    return on;
+}
+
 bool llama_model_loader::load_all_data(
         struct ggml_context * ctx,
         llama_buf_map & bufs,
@@ -1560,6 +1571,17 @@ bool llama_model_loader::load_all_data(
                 buf_mmap = bufs.at(weight->idx);
             }
             uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
+
+            // EdgeML (env EDGEML_EXPERT_MADVISE=1, default OFF): hint the routed-
+            // expert tensor pages as MADV_RANDOM so the kernel skips read-ahead
+            // around cold experts under memory pressure. Scoped to "_exps" tensors
+            // (ffn_{down,up,gate}_exps); shared experts / attention are untouched.
+            if (edgeml_expert_madvise_enabled()) {
+                const char * nm = ggml_get_name(cur);
+                if (nm && strstr(nm, "_exps")) {
+                    mapping->advise_random_range(weight->offs, n_size);
+                }
+            }
 
             if (check_tensors) {
                 validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
