@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <vector>
 #include <unordered_map>
+#include <map>
 #include <algorithm>
 #include <string>
 
@@ -310,6 +311,114 @@ private:
     long   drafted_      = 0;
     long   accepted_     = 0;
     long   disabled_at_  = -1;
+};
+
+// Adaptive draft-width controller (EdgeML "Moonlight-fast" lane B).
+//
+// Prompt-lookup speculative decode drafts D tokens per verify. The best D is
+// workload-dependent: repetitive / code text sustains wide drafts (D=8 accepts
+// most of the batch), while novel prose barely matches (D=2 already over-drafts).
+// A single fixed D therefore either leaves tok/s on the table on repetitive text
+// or burns it re-verifying dead drafts on prose. This controller adapts D per
+// stream from the SAME accept-rate signal the guard already tracks — and because
+// draft width only affects SPEED (every drafted token is verified against the
+// target model's greedy argmax), it is free to move D aggressively: the EMITTED
+// token stream is bit-identical for ANY D trajectory. D is a throughput knob, not
+// an output knob.
+//
+// Policy (pre-registered — do NOT retune to a benchmark):
+//   floor       D = 2   the always-safe width (also the CPU bit-exact width; a
+//                       floor of 2 keeps >=1 real drafted token every step).
+//   ceiling     caller-supplied, == effective_draft_width(D_req, cpu_numerics,...)
+//                       so the CPU-safe clamp AND the -ot experts-on-CPU pin are
+//                       honored BY CONSTRUCTION (the controller never proposes a
+//                       width the numerics can't reproduce bit-exactly).
+//   ESCALATE    +step (=2), at most once per `commit_step` (=64) committed tokens,
+//                       and only while the guard EMA >= hi (=0.80). Widening is
+//                       EARNED by a sustained high accept-rate, never the default.
+//   DE-ESCALATE -step, IMMEDIATELY, the instant one verify's own accept-rate < lo
+//                       (=0.50); the escalation clock resets too. One bad batch
+//                       hands the width straight back.
+// The asymmetry is deliberate: slow to widen (needs a sustained 0.80 EMA over 64
+// tokens), instant to retreat (a single sub-0.50 batch). That bounds the wasted-
+// draft cost of a workload change (prose->code and back) to a single wide verify.
+//
+// Header-only and free of any llama/ggml dependency (integers + a small map), so
+// examples/moonlight-fast/adaptive_selftest.cpp exercises the whole policy with
+// plain clang++ and no model.
+class AdaptiveWidth {
+public:
+    struct WidthStat  { long commits = 0, drafts = 0, accepts = 0, verifies = 0; };
+    // one width change; reason: 'I'=initial, 'E'=escalate, 'D'=de-escalate.
+    struct Transition { long committed = 0; int from = 0, to = 0; char reason = '?'; };
+
+    AdaptiveWidth(int floor_d = 2, int ceil_d = 8, long commit_step = 64,
+                  double hi = 0.80, double lo = 0.50, int step = 2)
+        : floor_(floor_d < 1 ? 1 : floor_d),
+          ceil_(ceil_d), commit_step_(commit_step < 1 ? 1 : commit_step),
+          hi_(hi), lo_(lo), step_(step < 1 ? 1 : step) {
+        if (ceil_ < floor_) ceil_ = floor_;          // ceiling below floor => pinned at floor
+        d_cur_ = floor_;                              // always start narrow
+        trace_.push_back({0, 0, d_cur_, 'I'});
+    }
+
+    int  width()         const { return d_cur_; }
+    int  floor_width()   const { return floor_; }
+    int  ceil_width()    const { return ceil_; }
+    long escalations()   const { return n_up_; }
+    long deescalations() const { return n_dn_; }
+    const std::vector<Transition> & trajectory() const { return trace_; }
+    const std::map<int, WidthStat> & per_width() const { return stats_; }
+
+    // Record ONE verify performed at the CURRENT width, then set the width for the
+    // NEXT propose. Ordering guarantees each verify is attributed to the width it
+    // was actually drafted at (width only ever changes at the tail of this call).
+    //   n_draft         : draft tokens offered this verify (0 => greedy step)
+    //   n_acc           : how many of those drafts were accepted
+    //   n_commit        : tokens committed this verify (>=1)
+    //   ema             : guard.ema() AFTER this verify (the sustained signal)
+    //   committed_total : running committed-token count (the escalation clock)
+    void record(long n_draft, long n_acc, long n_commit, double ema, long committed_total) {
+        WidthStat & ws = stats_[d_cur_];
+        ws.commits  += n_commit;
+        ws.drafts   += n_draft;
+        ws.accepts  += n_acc;
+        ws.verifies += 1;
+
+        // De-escalate on a single weak verify (instantaneous accept-rate), instantly.
+        if (n_draft > 0) {
+            const double inst = (double) n_acc / (double) n_draft;
+            if (inst < lo_ && d_cur_ > floor_) {
+                const int from = d_cur_;
+                d_cur_  = std::max(floor_, d_cur_ - step_);
+                anchor_ = committed_total;            // reset the escalation clock
+                ++n_dn_;
+                trace_.push_back({committed_total, from, d_cur_, 'D'});
+                return;                               // never widen in a step we shrank
+            }
+        }
+        // Escalate at most once per commit_step committed tokens, only on a strong EMA.
+        if (d_cur_ < ceil_ && ema >= hi_ && committed_total - anchor_ >= commit_step_) {
+            const int from = d_cur_;
+            d_cur_  = std::min(ceil_, d_cur_ + step_);
+            anchor_ = committed_total;
+            ++n_up_;
+            trace_.push_back({committed_total, from, d_cur_, 'E'});
+        }
+    }
+
+private:
+    int    floor_;
+    int    ceil_;
+    long   commit_step_;
+    double hi_, lo_;
+    int    step_;
+    int    d_cur_   = 2;
+    long   anchor_  = 0;      // committed_total at the last width change
+    long   n_up_    = 0;
+    long   n_dn_    = 0;
+    std::vector<Transition>   trace_;
+    std::map<int, WidthStat>  stats_;
 };
 
 } // namespace edgeml

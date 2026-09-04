@@ -523,6 +523,29 @@ struct llama_mmap::impl {
         mapped_fragments = std::move(new_mapped_fragments);
     }
 
+    // EdgeML: hint [offset, offset+len) as MADV_RANDOM. Unlike unmap_fragment's
+    // align_range (which shrinks to fully-contained pages), we round the start
+    // DOWN and the end UP so the tensor's bytes are fully covered, then clamp to
+    // the mapping. posix_madvise is advisory: on failure we warn and continue.
+    void advise_random_range(size_t offset, size_t len) {
+        if (len == 0) {
+            return;
+        }
+        const size_t page_size = (size_t) sysconf(_SC_PAGESIZE);
+        size_t first = offset & ~(page_size - 1);
+        size_t last  = (offset + len + page_size - 1) & ~(page_size - 1);
+        if (last > size) {
+            last = size;
+        }
+        if (last <= first) {
+            return;
+        }
+        if (posix_madvise((uint8_t *) addr + first, last - first, POSIX_MADV_RANDOM)) {
+            LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_RANDOM) failed: %s\n",
+                    strerror(errno));
+        }
+    }
+
     ~impl() {
         for (const auto & frag : mapped_fragments) {
             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
@@ -582,6 +605,11 @@ struct llama_mmap::impl {
         GGML_UNUSED(last);
     }
 
+    void advise_random_range(size_t offset, size_t len) {
+        GGML_UNUSED(offset);
+        GGML_UNUSED(len);
+    }
+
     ~impl() {
         if (hMapping) {
             if (addr) {
@@ -611,6 +639,11 @@ struct llama_mmap::impl {
 
         throw std::runtime_error("mmap not supported");
     }
+
+    void advise_random_range(size_t offset, size_t len) {
+        GGML_UNUSED(offset);
+        GGML_UNUSED(len);
+    }
 #endif
 
     void * addr;
@@ -624,6 +657,7 @@ size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+void llama_mmap::advise_random_range(size_t offset, size_t len) const { pimpl->advise_random_range(offset, len); }
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;

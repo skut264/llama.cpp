@@ -50,6 +50,12 @@ struct llama_mmap {
 
     void unmap_fragment(size_t first, size_t last);
 
+    // EdgeML: advise a byte sub-range as MADV_RANDOM (page-aligned outward to
+    // fully cover [offset, offset+len)). Advisory only; never changes contents
+    // or the mapped-fragment set. No-op on non-POSIX. See llama-model-loader.cpp
+    // (EDGEML_EXPERT_MADVISE) for the routed-expert use.
+    void advise_random_range(size_t offset, size_t len) const;
+
     static const bool SUPPORTED;
 
 private:
